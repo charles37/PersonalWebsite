@@ -2,6 +2,7 @@ module Main exposing (..)
 import List.Extra
 
 import Browser
+import Task
 import Html exposing (..)
 import Html.Attributes exposing (..)
 import Html.Events exposing (..)
@@ -14,11 +15,17 @@ import Optics.Core exposing (..)
 import Platform.Cmd as Cmd
 import List.Extra
 import Maybe exposing (withDefault)
+import Browser.Dom
+import Browser.Navigation
+import Random 
+
 
 type alias Model =
     { snake : Snake
     , boxWidth : Int
     , boxHeight : Int
+    , textSections : List TextSection
+    , food : Food
     }
 
 snake_ : SimpleLens ls { a | snake : b } b
@@ -45,6 +52,12 @@ direction_ : SimpleLens ls { a | direction : b } b
 direction_ =
     lens .direction (\b a -> { b | direction = a })
 
+type alias Food =
+    { position : Point
+    , iconClass : String
+    }
+
+
 type alias Point =
     { x : Int
     , y : Int
@@ -52,48 +65,111 @@ type alias Point =
 
 type alias TextSection =
     { title : String
-    , description : String
     , position : Point
+    , url : String
+    , iconClass : String
     }
 
-textSections : List TextSection
-textSections =
+initTextSections : List TextSection
+initTextSections =
     [ { title = "Resume"
-      , description = "Move the snake here to access my resume."
       , position = { x = 0, y = 0 }
+      , url = "https://your_resume_url_here"
+      , iconClass = "fas fa-file"
       }
     , { title = "GitHub"
-      , description = "Move the snake here to access my GitHub profile."
       , position = { x = 19, y = 0 }
+      , url = "https://github.com/charles37"
+      , iconClass = "fab fa-github"
       }
     , { title = "Twitter"
-      , description = "Move the snake here to see my latest tweets."
       , position = { x = 0, y = 19 }
+      , url = "https://twitter.com/benprevor"
+      , iconClass = "fab fa-twitter"
       }
     , { title = "Blog"
-      , description = "Move the snake here to read my articles."
       , position = { x = 19, y = 19 }
+      , url = "https://substack.com"
+      , iconClass = "fas fa-blog"
       }
     ]
 
-init : Model
+updateTextSectionPositions : Int -> Int -> List TextSection -> List TextSection
+updateTextSectionPositions boxWidth boxHeight myTextSections =
+    List.map
+        (\textSection ->
+            let
+                xPos = if textSection.position.x == 0 then 0 else (boxWidth - 1)
+                yPos = if textSection.position.y == 0 then 0 else (boxHeight - 1)
+            in
+            { textSection | position = { x = xPos, y = yPos } }
+        )
+        myTextSections
+
+updateFoodPosition : Int -> Int -> Food -> Food
+updateFoodPosition boxWidth boxHeight food =
+    let
+        -- x and y should start at center of box
+        xPos = boxWidth // 2
+        yPos = boxHeight // 2
+    in
+    { food | position = { x = xPos, y = yPos } }
+       
+
+ 
+
+init : ( Model, Cmd Msg )
 init =
-    { snake =
-        { body =
-            [ { x = 0, y = 0 }
-            , { x = 1, y = 0 }
-            , { x = 2, y = 0 }
-            ]
-        , direction = Right
-        }
-    , boxWidth = 20
-    , boxHeight = 20
-    }
+    let
+        boxWidth = 20
+        boxHeight = 20
+        centerX = boxWidth // 2
+        centerY = boxHeight // 2
+        model =
+            { snake =
+                { body =
+                    [ { x = centerX, y = centerY }
+                    , { x = centerX - 1, y = centerY }
+                    , { x = centerX - 2, y = centerY }
+                    ]
+                , direction = Right
+                }
+            , boxWidth = boxWidth
+            , boxHeight = boxHeight
+            , textSections = initTextSections
+            , food =
+                { position = { x = centerX - 1, y = centerY - 1 }
+                , iconClass = "fas fa-cookie-bite"
+                }
+            }
+    in
+    ( model
+        , Task.perform
+            (\viewport ->
+                let
+                    ( bw, bh ) =
+                        windowSizeToBoxDimensions (round viewport.viewport.width) (round viewport.viewport.height)
+                    updatedTextSections = updateTextSectionPositions bw bh initTextSections
+                    updatedFood = updateFoodPosition bw bh model.food
+                in
+                ResizeWindow bw bh updatedTextSections updatedFood
+            )
+            Browser.Dom.getViewport
+        )
+
 
 type Msg
     = ChangeDirection Direction
     | Move
-    | ResizeWindow Int Int
+    | ResizeWindow Int Int (List TextSection) Food
+    | Navigate String
+    | NewFood Food
+
+wrapMessage : msg -> Cmd msg
+wrapMessage msg =
+    Task.succeed msg
+        |> Task.perform identity
+
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
@@ -103,17 +179,46 @@ update msg model =
             |> Debug.log "newDirection"
         Move ->
             let
-                newSnake = moveSnake model.snake
+                newHead = getNewHead model.snake
+                collidedSection = collisionDetected newHead model.textSections 
+                collidedFood = newHead == model.food.position 
             in
-            ( { model | snake = newSnake }
-            , Cmd.none
-            )
-            |> Debug.log "newSnake"
-        ResizeWindow width height ->
-            ( { model | boxWidth = width, boxHeight = height }, Cmd.none )
+            case (collidedSection,collidedFood) of
+                (Just section, _) ->
+                    ( model, wrapMessage (Navigate section.url) )
+                (_, True) ->
+                        let
+                            largeNewSnake = assign body_ (newHead :: model.snake.body) model.snake 
+                        in
+                            ( { model | snake = largeNewSnake } 
+                            , randomFood model
+                            )
+                _ -> ( { model | snake = moveSnake model.snake }, Cmd.none )
+        NewFood newFood ->
+            ( { model | food = newFood }, Cmd.none )
+        ResizeWindow width height updatedTextSections updatedFood ->
+            ( { model | boxWidth = width, boxHeight = height, textSections = updatedTextSections, food = updatedFood }, Cmd.none )
+        Navigate url ->
+            ( model, Browser.Navigation.load url )
 
-moveSnake : Snake -> Snake
-moveSnake snake =
+randomFood : Model -> Cmd Msg
+randomFood model =
+    let
+        randomXY =
+            Random.pair (Random.int 0 (model.boxWidth - 1)) (Random.int 0 (model.boxHeight - 1))
+    in
+    Random.generate 
+        (\( x, y ) ->
+            let
+                newFood =
+                    { position = { x = x, y = y }, iconClass = "fas fa-cookie-bite" }
+            in
+            NewFood newFood
+        )
+        randomXY
+    
+getNewHead : Snake -> Point
+getNewHead snake =
     let
         head =
             List.head snake.body
@@ -137,10 +242,19 @@ moveSnake snake =
                 Nothing ->
                     { x = 0, y = 0 }
     in
-    assign body_ (newHead :: (withDefault [] (List.Extra.init snake.body))) snake
+    newHead
 
-windowSizeToBoxDimensions : Int -> Int -> ( Int, Int )
-windowSizeToBoxDimensions width height =
+moveSnake : Snake -> Snake
+moveSnake snake =
+    assign body_ (getNewHead snake :: (withDefault [] (List.Extra.init snake.body))) snake
+
+collisionDetected : Point -> List TextSection -> Maybe TextSection
+collisionDetected point textParts=
+    List.filter (\textSection -> textSection.position == point) textParts 
+    |> List.head
+
+windowSizeToBoxDimensions : Int -> Int -> ( Int, Int ) 
+windowSizeToBoxDimensions width height = 
     let
         boxWidth =
             width // 20
@@ -151,13 +265,20 @@ windowSizeToBoxDimensions width height =
     ( boxWidth, boxHeight )
 
 subscriptions : Model -> Sub Msg
-subscriptions _ =
-   Sub.batch
-       [ Browser.Events.onKeyDown
-           (Json.Decode.map ChangeDirection directionDecoder)
-       , Time.every 200 (\_ -> Move)
-       , Browser.Events.onResize (\w h -> let ( bw, bh ) = windowSizeToBoxDimensions w h in ResizeWindow bw bh)
-       ]
+subscriptions model =
+    Sub.batch
+        [ Browser.Events.onKeyDown
+            (Json.Decode.map ChangeDirection directionDecoder)
+        , Time.every 200 (\_ -> Move)
+        , Browser.Events.onResize (\w h ->
+            let
+                ( bw, bh ) = windowSizeToBoxDimensions w h
+                updatedTextSections = updateTextSectionPositions bw bh model.textSections
+                updatedFood = updateFoodPosition bw bh model.food
+            in
+            ResizeWindow bw bh updatedTextSections updatedFood
+          )
+        ]
 
 directionDecoder : Json.Decode.Decoder Direction
 directionDecoder =
@@ -176,6 +297,18 @@ directionDecoder =
                             Json.Decode.succeed Left
 
                         39 ->
+                            Json.Decode.succeed Right
+
+                        87 -> -- W key
+                            Json.Decode.succeed Up
+
+                        83 -> -- S key
+                            Json.Decode.succeed Down
+
+                        65 -> -- A key
+                            Json.Decode.succeed Left
+
+                        68 -> -- D key
                             Json.Decode.succeed Right
 
                         _ ->
@@ -210,23 +343,17 @@ view model =
             , style "height" (String.fromInt (model.boxHeight * 20) ++ "px")
             , style "border" "1px solid black"
             ]
-            (List.map viewSegment model.snake.body ++ List.map viewTextSection textSections)
+            (List.map viewSegment model.snake.body ++ List.map viewTextSection model.textSections ++ [viewFood model.food])
         ]
 
-viewTextSection : TextSection -> Html Msg
-viewTextSection textSection =
+viewFood : Food -> Html Msg
+viewFood model =
     let
         xPos =
-            if textSection.position.x == 0 then
-                "10px"
-            else
-                "calc(100% - 10px - 20px)"
+            String.fromInt (model.position.x * 20) ++ "px"
 
         yPos =
-            if textSection.position.y == 0 then
-                "10px"
-            else
-                "calc(100% - 10px - 20px)"
+            String.fromInt (model.position.y * 20) ++ "px"
     in
     div
         [ style "position" "absolute"
@@ -235,12 +362,40 @@ viewTextSection textSection =
         , style "left" xPos
         , style "top" yPos
         , style "text-align" "center"
+        , style "color" "red"
+        , style "font-size" "20px"
+        ]
+        [ i [ class model.iconClass ] [] ]
+    
+
+viewTextSection : TextSection -> Html Msg
+viewTextSection textSection =
+    let
+        xPos =
+            if textSection.position.x == 0 then
+                "10px"
+            else
+                "calc(100% - 10px - 30px - 20px)"
+
+        yPos =
+            if textSection.position.y == 0 then
+                "10px"
+            else
+                "calc(100% - 10px - 30px - 40px)"
+    in
+    div
+        [ style "position" "absolute"
+        , style "width" "30px"
+        , style "height" "30px"
+        , style "left" xPos
+        , style "top" yPos
+        , style "text-align" "justify"
         , style "color" "blue"
-        , style "font-size" "10px"
+        , style "font-size" "14px"
         ]
         [ text textSection.title
         , br [] []
-        , text textSection.description
+        , i [ class textSection.iconClass, style "font-size" "50px" ] [] 
         ]
 
 viewSegment : Point -> Html Msg
@@ -258,7 +413,7 @@ viewSegment point =
 main : Program () Model Msg
 main =
    Browser.element
-       { init = \_ -> ( init, Cmd.none )
+       { init = \_ -> init 
        , view = view
        , update = update
        , subscriptions = subscriptions
